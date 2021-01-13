@@ -6,7 +6,9 @@
 - check m-model of correct [X]
 - do sequencing for m-model-training [X]
 - do testrun on CarRacer [X]
+- added reward learning / done learning [X]
 
+- check dreaming module latentspace next state dreaming with VAE [ ]
 - add dreaming mode (adding done and reward to m-model) [ ]
 - do script version of it (adding iterative scheme) [ ]
 - write Readme [ ]
