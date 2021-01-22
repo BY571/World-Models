@@ -1,3 +1,4 @@
+
 # World-Models
 
 
@@ -8,13 +9,10 @@
 - do testrun on CarRacer [X]
 - added reward learning / done learning [X]
 
-- check dreaming module latentspace next state dreaming with VAE [ ]
-- add dreaming mode (adding done and reward to m-model) [ ]
-- do script version of it (adding iterative scheme) [ ]
+- check dreaming module latentspace next state dreaming with VAE [X]
+- add dreaming mode (adding done and reward to m-model) [X]
+- add train C-Module [X]
+- adding iterative training scheme [ ]
+        - if current ep-reward > average-dataset -> dataset.append(current)
 - write Readme [ ]
-
-## Questions:
-- VAE mu/sig as encoded?
-- check adam optim for m-model training
-- train for bigger dataset
-- 3 headed m-model for [pi, mu, sig]
+- create ray script [ ]

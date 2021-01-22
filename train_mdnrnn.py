@@ -5,6 +5,7 @@ import argparse
 import numpy as np
 import torch.nn as nn
 from train_vae import VAE
+from typing import Tuple
 import torch.optim as optim
 import torch.nn.functional as F
 from torch.distributions import Normal
@@ -29,19 +30,36 @@ def parse_arguments()-> argparse.Namespace:
     parser.add_argument("--episodes", type=int, default=20, help="Number of training episodes (default: 20)")
     parser.add_argument("--lr", type=float, default=1e-3, help="Learning rate (default: 1e-3)")
     parser.add_argument("--device", type=str, default="cuda:0", help="Training device cpu or gpu (default: cuda:0)")
-    parser.add_argument("--save_name", type=str, help="Name of the trained encoder decoder state_dicts")
+    parser.add_argument("--save_name", type=str, help="Name how the trained model shall be saved")
     parser.add_argument("--encoder_dir", type=str, help="Directory of the trained encoder state dict")
     parser.add_argument("--plot", type=int, choices=[0,1], default=1, help="Plot training results if set to 1 (default: 1)")
     args = parser.parse_args()
     return args
 
 def load_samples(name:str)-> dict:
+    """Loading the saved data set.
+
+    Args:
+        name (str): Name of the pickle file you want to load.
+
+    Returns:
+        dict: Returns a dictionary of the collected data 
+              with the keys:
+              ["states", "actions", "next_states", "rewards", "dones"]
+    """
     with open("./datasets/"+name, 'rb') as handle:
         samples = pickle.load(handle)
     return samples
 
-def create_dataset(args)-> DataLoader:
+def create_dataset(args: dict)-> DataLoader:
+    """Creates a training Dataloader
 
+    Args:
+        args (dict): Training specific arguments.
+
+    Returns:
+        DataLoader: PyTorch Dataloader
+    """
     samples = load_samples(args.dataset_name)
 
     state_shape = samples["states"][0].shape
@@ -136,7 +154,7 @@ def plot_losses(losses):
     import matplotlib.pyplot as plt
     plt.plot(losses)
     plt.xlabel("Epochs")
-    plt.ylable("Loss")
+    plt.ylabel("Loss")
     plt.legend()
     plt.savefig("MDN-RNN-Training.jpg")
     plt.show()
@@ -152,17 +170,17 @@ class MModel(nn.Module):
         self.action_size = action_size
         self.latent_size = latent_size
         self.n_gaussians = n_gaussians
-
         
         if rnn_type == "LSTM":
             self.rnn_layer = nn.LSTM(self.input_shape, hidden_size, batch_first=True)
         elif rnn_type == "GRU":
             self.rnn_layer = nn.GRU(self.input_shape, hidden_size, batch_first=True)
             
-        self.gmm_layer = nn.Linear(hidden_size,  (2 * latent_size + 1) * n_gaussians + 2) #(2 * latent_size + 1) * n_gaussians + 2
-        #self.mu_layer = nn.Linear(hidden_size,  latent_size * n_gaussians)
-        #self.sig_layer = nn.Linear(hidden_size, latent_size * n_gaussians)
-        
+        self.pi_layer = nn.Linear(hidden_size, latent_size*n_gaussians)
+        self.mu_layer = nn.Linear(hidden_size,  latent_size * n_gaussians)
+        self.sig_layer = nn.Linear(hidden_size, latent_size * n_gaussians)
+        self.reward_layer = nn.Linear(hidden_size, 1)
+        self.done_layer = nn.Linear(hidden_size, 1)
         
     def forward(self, latent_vector: torch.Tensor, action:torch.Tensor, hidden_state=None)-> torch.Tensor:
         """ Simple forward pass with the RNN """
@@ -184,28 +202,21 @@ class MModel(nn.Module):
         batch_size = y.shape[0]
         sequence_length = y.shape[1]
 
-        
-        gmm = self.gmm_layer(y)
-
-        stride = self.n_gaussians * self.latent_size
-
-        mu = gmm[:, :, :stride]
+        mu = self.mu_layer(y)
         mu = mu.view(batch_size, sequence_length, self.n_gaussians, self.latent_size)
-
-        sigma = gmm[:, :, stride:2 * stride]
+        
+        sigma = self.sig_layer(y)
         sigma = sigma.view(batch_size, sequence_length, self.n_gaussians, self.latent_size)
         sigma = torch.exp(sigma)
-
-        pi = gmm[:, :, 2 * stride: 2 * stride + self.n_gaussians]
-        pi = pi.view(batch_size, sequence_length, self.n_gaussians)
-        logpi = F.log_softmax(pi, dim=-1)
-
-        rs = gmm[:, :, -2] # needed later if start dreaming
-
-        ds = gmm[:, :, -1] # needed later if start dreaming
         
+        pi = self.pi_layer(y)
+        pi = pi.view(batch_size, sequence_length, self.n_gaussians, self.latent_size)
+        pi = F.softmax(pi, dim=-1)
         
-        return logpi, mu, sigma, rs, ds
+        rs = self.reward_layer(y).squeeze()
+        ds = F.sigmoid(self.done_layer(y)).squeeze()       
+        
+        return pi, mu, sigma, rs, ds
     
     def predict_next_z(self,latent_vector: torch.Tensor, action:torch.Tensor, tau: float, hidden_state=None)-> torch.Tensor:
         """ Predicts the next Latent Vector Z """
@@ -213,35 +224,28 @@ class MModel(nn.Module):
         pi, mu, sigma, rs, ds = values[0], values[1], values[2], values[3], values[4]
         
         dist = Normal(mu, sigma*tau)
-        z_ = (pi.exp().unsqueeze(-1)*dist.sample()).sum(2)
+        z_ = (pi*dist.sample()).sum(2)
         
         return (z_, rs, ds), hidden_state
         
 # M-Model loss calculation
-def mdn_loss_fn(y, logpi, mu, sigma):
-
-    dist = Normal(mu, sigma)
-
-    log_probs = dist.log_prob(y)
-    log_probs = logpi + torch.sum(log_probs, dim=-1)
-    max_log_probs = torch.max(log_probs, dim=-1, keepdim=True)[0]
-    log_probs = log_probs - max_log_probs
-
-    probs = torch.exp(log_probs)
-    sum_probs = torch.sum(probs, dim=-1)
-    log_prob = max_log_probs.squeeze() + torch.log(sum_probs)
-    
-    return -log_prob.mean()
+def mdn_loss_fn(y, out_pi, out_mu, out_sigma):
+    y = y.view(-1, 16, 1, 32)
+    result = Normal(loc=out_mu, scale=out_sigma)
+    result = torch.exp(result.log_prob(y))
+    result = torch.sum(result * out_pi, dim=2)
+    result = -torch.log( result)
+    return torch.mean(result)
 
 def criterion(y, pi, mu, sigma):
-    y = y.unsqueeze(-2) 
+    #y = y.unsqueeze(-2) 
     return mdn_loss_fn(y, pi, mu, sigma)
 
 def get_reward_loss(reward, pred_reward):
     return F.mse_loss(pred_reward, reward)
 
 def get_done_loss(done, done_pred):
-    return F.binary_cross_entropy_with_logits(done_pred, done)
+    return F.binary_cross_entropy(done_pred, done)
 
 
 
@@ -257,6 +261,7 @@ if __name__ == "__main__":
             device = torch.device("cpu")
     else:
         device = torch.device("cpu")
+    print("Using: ", device)
     vae = VAE(state_size=state_shape, device=device)
     vae.encoder.load_state_dict(torch.load(args.encoder_dir))
     del(vae.decoder)
@@ -267,7 +272,7 @@ if __name__ == "__main__":
                      rnn_type=args.rnn_type)
 
     training_results, mdn_rnn = train(args, vae, mdn_rnn, dataloader)
-    print("Finished Training!")
+    print("\nFinished Training!")
         
     if not os.path.exists('trained_models/MDN_RNNs/'+args.save_name):
         os.makedirs('trained_models/MDN_RNNs/'+args.save_name)
@@ -275,7 +280,7 @@ if __name__ == "__main__":
     # save model
     torch.save(mdn_rnn.state_dict(), "./trained_models/MDN_RNNs/"+args.save_name+".pth")
 
-    print("\nSaved vae state dicts to /trained_models/MDN_RNNs/{}".format(args.save_name))
+    print("\nSaved MDN-RNN state dicts to /trained_models/MDN_RNNs/{}".format(args.save_name))
 
     if args.plot:
         plot_losses(training_results)
